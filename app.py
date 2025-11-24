@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from sklearn.linear_model import Lasso, LassoCV, Ridge, RidgeCV, LinearRegression
+from sklearn.linear_model import Lasso, LassoCV, Ridge, RidgeCV, LinearRegression, lasso_path
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.datasets import fetch_california_housing, load_diabetes
@@ -76,7 +76,7 @@ def load_sample_dataset(dataset_name):
 
 @st.cache_data
 def compute_lasso_path(X, y, alphas, standardize=True):
-    """Compute Lasso regularization path for visualization."""
+    """Compute Lasso regularization path using optimized sklearn function."""
     if standardize:
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
@@ -84,13 +84,47 @@ def compute_lasso_path(X, y, alphas, standardize=True):
         X_scaled = X
         scaler = None
     
-    coefs = []
-    for alpha in alphas:
-        lasso = Lasso(alpha=alpha, max_iter=2000)
-        lasso.fit(X_scaled, y)
-        coefs.append(lasso.coef_)
+    # Use sklearn's optimized lasso_path which is much faster
+    # It computes the full path efficiently using coordinate descent
+    alphas_path, coefs_path, _ = lasso_path(
+        X_scaled, y, 
+        alphas=alphas,
+        max_iter=2000,
+        return_n_iter=True
+    )
     
-    return np.array(coefs), scaler
+    # Transpose to get shape (n_alphas, n_features)
+    coefs_path = coefs_path.T
+    
+    return coefs_path, scaler
+
+@st.cache_data
+def compute_cv_results(X_train_scaled, y_train, alphas, cv_folds):
+    """Compute cross-validation results with caching."""
+    lasso_cv = LassoCV(
+        alphas=alphas,
+        cv=cv_folds,
+        max_iter=2000,
+        random_state=42,
+        n_jobs=-1
+    )
+    lasso_cv.fit(X_train_scaled, y_train)
+    return lasso_cv
+
+@st.cache_data
+def compute_comparison_models(X_train_scaled, y_train, alphas, cv_folds, optimal_alpha):
+    """Compute Ridge and OLS models for comparison with caching."""
+    # Ridge with optimal alpha from RidgeCV
+    ridge_cv = RidgeCV(alphas=alphas, cv=cv_folds)
+    ridge_cv.fit(X_train_scaled, y_train)
+    optimal_ridge = Ridge(alpha=ridge_cv.alpha_)
+    optimal_ridge.fit(X_train_scaled, y_train)
+    
+    # OLS
+    ols = LinearRegression()
+    ols.fit(X_train_scaled, y_train)
+    
+    return optimal_ridge, ridge_cv.alpha_, ols
 
 def main():
     # Header
@@ -143,8 +177,15 @@ def main():
         )
         n_alphas = st.slider(
             "Number of Alpha Values",
-            50, 200, 100,
-            help="More values = smoother path but slower computation"
+            30, 150, 50,
+            help="More values = smoother path but slower computation. Default: 50 for faster performance."
+        )
+        
+        # Performance mode toggle
+        use_fast_mode = st.checkbox(
+            "⚡ Fast Mode (Recommended)",
+            value=True,
+            help="Use optimized algorithms for faster computation. Uncheck for more precise results."
         )
         
         st.divider()
@@ -237,6 +278,10 @@ def main():
             st.warning("⚠️ Please select at least one feature variable.")
             return
         
+        # Performance warning for too many features
+        if len(feature_vars) > 20 and not use_fast_mode:
+            st.warning(f"⚠️ You have selected {len(feature_vars)} features. Consider enabling Fast Mode or reducing the number of features for better performance.")
+        
         # Prepare data
         X = df[feature_vars].copy()
         y = df[target_var].copy()
@@ -273,12 +318,16 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        # Generate alpha values
-        alphas = np.logspace(np.log10(alpha_min), np.log10(alpha_max), n_alphas)
+        # Generate alpha values (reduce for fast mode)
+        effective_n_alphas = n_alphas if not use_fast_mode else min(n_alphas, 50)
+        alphas = np.logspace(np.log10(alpha_min), np.log10(alpha_max), effective_n_alphas)
         
-        # Compute path
-        with st.spinner("Computing Lasso path..."):
-            coefs_path, _ = compute_lasso_path(X_train, y_train, alphas, standardize=True)
+        if use_fast_mode and n_alphas > 50:
+            st.info(f"⚡ Fast Mode: Using {effective_n_alphas} alpha values for faster computation.")
+        
+        # Compute path (cached and optimized)
+        with st.spinner("Computing Lasso path (this may take a moment on first run)..."):
+            coefs_path, path_scaler = compute_lasso_path(X_train, y_train, alphas, standardize=True)
         
         # Create path plot
         fig_path = go.Figure()
@@ -381,27 +430,26 @@ def main():
         
         cv_folds = st.slider("CV Folds:", 3, 10, 5, help="Number of cross-validation folds")
         
-        with st.spinner("Running cross-validation..."):
-            # LassoCV
-            lasso_cv = LassoCV(
-                alphas=alphas,
-                cv=cv_folds,
-                max_iter=2000,
-                random_state=42,
-                n_jobs=-1
-            )
-            lasso_cv.fit(X_train_scaled, y_train)
+        # Use fewer alphas for CV in fast mode to speed up computation
+        cv_alphas = alphas if not use_fast_mode else np.logspace(
+            np.log10(alpha_min), np.log10(alpha_max), min(30, len(alphas))
+        )
+        
+        with st.spinner("Running cross-validation (cached after first run)..."):
+            # Use cached CV computation
+            lasso_cv = compute_cv_results(X_train_scaled, y_train, cv_alphas, cv_folds)
             optimal_alpha = lasso_cv.alpha_
             
-            # Get CV scores
+            # Get CV scores (need to match the alphas used)
             cv_scores = -lasso_cv.mse_path_.mean(axis=1)
             cv_stds = lasso_cv.mse_path_.std(axis=1)
+            cv_alphas_used = cv_alphas  # Use the alphas we passed to CV
         
         # Plot CV curve
         fig_cv = go.Figure()
         
         fig_cv.add_trace(go.Scatter(
-            x=np.log10(alphas),
+            x=np.log10(cv_alphas_used),
             y=cv_scores,
             mode='lines',
             name='CV Score',
@@ -550,17 +598,11 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        # Train all models
-        with st.spinner("Training comparison models..."):
-            # Ridge with optimal alpha from RidgeCV
-            ridge_cv = RidgeCV(alphas=alphas, cv=cv_folds)
-            ridge_cv.fit(X_train_scaled, y_train)
-            optimal_ridge = Ridge(alpha=ridge_cv.alpha_)
-            optimal_ridge.fit(X_train_scaled, y_train)
-            
-            # OLS
-            ols = LinearRegression()
-            ols.fit(X_train_scaled, y_train)
+        # Train all models (cached)
+        with st.spinner("Training comparison models (cached after first run)..."):
+            optimal_ridge, optimal_ridge_alpha, ols = compute_comparison_models(
+                X_train_scaled, y_train, cv_alphas, cv_folds, optimal_alpha
+            )
         
         # Evaluate all models
         models = {
@@ -584,7 +626,7 @@ def main():
                 'Test RMSE': np.sqrt(mean_squared_error(y_test, y_test_pred)),
                 'Test MAE': mean_absolute_error(y_test, y_test_pred),
                 'Non-zero Coefs': n_nonzero,
-                'Optimal α': optimal_alpha if name == 'Lasso' else (ridge_cv.alpha_ if name == 'Ridge' else 'N/A')
+                'Optimal α': optimal_alpha if name == 'Lasso' else (optimal_ridge_alpha if name == 'Ridge' else 'N/A')
             })
         
         comparison_df = pd.DataFrame(comparison_data)
