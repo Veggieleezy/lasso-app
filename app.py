@@ -86,12 +86,17 @@ def compute_lasso_path(X, y, alphas, standardize=True):
     
     # Use sklearn's optimized lasso_path which is much faster
     # It computes the full path efficiently using coordinate descent
-    alphas_path, coefs_path, _ = lasso_path(
+    # Don't request n_iter to avoid version compatibility issues
+    result = lasso_path(
         X_scaled, y, 
         alphas=alphas,
-        max_iter=2000,
-        return_n_iter=True
+        max_iter=2000
     )
+    
+    # Unpack results - lasso_path returns (alphas, coefs) or (alphas, coefs, n_iter)
+    # Use flexible unpacking to handle both cases
+    alphas_path = result[0]
+    coefs_path = result[1]
     
     # Transpose to get shape (n_alphas, n_features)
     coefs_path = coefs_path.T
